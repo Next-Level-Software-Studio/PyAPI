@@ -4,5 +4,5 @@ __pycache__/
 *.bak
 *.env
 venv/
-.vscode/
+.vscode/*
 !.vscode/c_cpp_properties.json
