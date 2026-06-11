@@ -1,0 +1,13 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/usr/include/libxml2/**",
+                "/usr/include/cjson"
+            ]
+        }
+    ],
+    "version": 4
+}
