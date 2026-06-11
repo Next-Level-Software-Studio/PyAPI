@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> // Nativo no Linux para strcasecmp
 #include <curl/curl.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -105,7 +106,6 @@ void preencher_repo(xmlNodePtr no, RepoGentoo *repo) {
     extrair_texto_xml(no, "description", repo->descricao, sizeof(repo->descricao));
     extrair_texto_xml(no, "homepage", repo->homepage, sizeof(repo->homepage));
     
-    // Procura o nó source e extrai o atributo type e o texto interno
     xmlNodePtr atual = no->children;
     while (atual != NULL) {
         if (strcmp((const char*)atual->name, "source") == 0) {
@@ -174,14 +174,23 @@ RepoGentoo* listar_todos_repos(int *total_repos) {
     xmlNodePtr raiz = xmlDocGetRootElement(doc);
     xmlNodePtr no_atual = raiz->children;
 
-    // Conta quantos repositórios existem primeiro
     int capacidade = 0;
     while (no_atual != NULL) {
         if (strcmp((const char*)no_atual->name, "repo") == 0) capacidade++;
         no_atual = no_atual->next;
     }
 
+    if (capacidade == 0) {
+        xmlFreeDoc(doc);
+        return NULL;
+    }
+
     RepoGentoo *lista = malloc(sizeof(RepoGentoo) * capacidade);
+    if (!lista) {
+        xmlFreeDoc(doc);
+        return NULL;
+    }
+
     no_atual = raiz->children;
     int idx = 0;
 
@@ -198,7 +207,7 @@ RepoGentoo* listar_todos_repos(int *total_repos) {
     return lista;
 }
 
-// Procura um repositório por nome na lista
+// Procura um repositório por nome na lista (Usa strcasecmp nativo do Linux)
 RepoGentoo* procurar_repo(const char* nome_procurado) {
     int total = 0;
     RepoGentoo *todos = listar_todos_repos(&total);
@@ -206,14 +215,11 @@ RepoGentoo* procurar_repo(const char* nome_procurado) {
 
     RepoGentoo *resultado = NULL;
     for (int i = 0; i < total; i++) {
-        // Comparação case-insensitive simples (strcasecmp do POSIX ou strcmpi)
-#ifdef _WIN32
-        if (strcmpi(todos[i].nome, nome_procurado) == 0) {
-#else
         if (strcasecmp(todos[i].nome, nome_procurado) == 0) {
-#endif
             resultado = malloc(sizeof(RepoGentoo));
-            memcpy(resultado, &todos[i], sizeof(RepoGentoo));
+            if (resultado) {
+                memcpy(resultado, &todos[i], sizeof(RepoGentoo));
+            }
             break;
         }
     }
@@ -226,11 +232,7 @@ PacoteGentoo* procurar_pacote(const char* categoria, const char* nome_pacote, co
     char url[512];
     long codigo_http = 0;
 
-#ifdef _WIN32
-    if (strcmpi(repo, "gentoo") == 0) {
-#else
     if (strcasecmp(repo, "gentoo") == 0) {
-#endif
         snprintf(url, sizeof(url), "https://api.github.com/repos/gentoo/gentoo/contents/%s/%s", categoria, nome_pacote);
     } else {
         snprintf(url, sizeof(url), "https://api.github.com/repos/gentoo-mirror/%s/contents/%s/%s", repo, categoria, nome_pacote);
@@ -252,40 +254,47 @@ PacoteGentoo* procurar_pacote(const char* categoria, const char* nome_pacote, co
     free(json_conteudo);
     if (!raiz_json) return NULL;
 
+    // Garante que a resposta é estruturada como esperado
+    if (!cJSON_IsArray(raiz_json)) {
+        printf("❌ Resposta inválida da API do GitHub (Esperava-se um Array).\n");
+        cJSON_Delete(raiz_json);
+        return NULL;
+    }
+
     PacoteGentoo *pkg = malloc(sizeof(PacoteGentoo));
+    if (!pkg) {
+        cJSON_Delete(raiz_json);
+        return NULL;
+    }
+
     snprintf(pkg->categoria, sizeof(pkg->categoria), "%s", categoria);
     snprintf(pkg->nome, sizeof(pkg->nome), "%s", nome_pacote);
     snprintf(pkg->repositorio_origem, sizeof(pkg->repositorio_origem), "%s", repo);
     pkg->total_versoes = 0;
 
-    if (cJSON_IsArray(raiz_json)) {
-        int tam_array = cJSON_GetArraySize(raiz_json);
-        char sufixo_ebuild[50];
-        snprintf(sufixo_ebuild, sizeof(sufixo_ebuild), "%s-", nome_pacote);
+    int tam_array = cJSON_GetArraySize(raiz_json);
+    char sufixo_ebuild[50];
+    snprintf(sufixo_ebuild, sizeof(sufixo_ebuild), "%s-", nome_pacote);
 
-        for (int i = 0; i < tam_array && pkg->total_versoes < 50; i++) {
-            cJSON *item = cJSON_GetArrayItem(raiz_json, i);
-            cJSON *nome_ficheiro = cJSON_GetObjectItemCaseSensitive(item, "name");
+    for (int i = 0; i < tam_array && pkg->total_versoes < 50; i++) {
+        cJSON *item = cJSON_GetArrayItem(raiz_json, i);
+        cJSON *nome_ficheiro = cJSON_GetObjectItemCaseSensitive(item, "name");
 
-            if (cJSON_IsString(nome_ficheiro) && nome_ficheiro->valuestring != NULL) {
-                char *nome_f = nome_ficheiro->valuestring;
-                size_t len_f = strlen(nome_f);
+        if (cJSON_IsString(nome_ficheiro) && nome_ficheiro->valuestring != NULL) {
+            char *nome_f = nome_ficheiro->valuestring;
+            size_t len_f = strlen(nome_f);
+            
+            if (len_f > 7 && strcmp(nome_f + len_f - 7, ".ebuild") == 0) {
+                char versao_limpa[64];
+                snprintf(versao_limpa, sizeof(versao_limpa), "%s", nome_f);
                 
-                // Filtro equivalente ao .endswith(".ebuild")
-                if (len_f > 7 && strcmp(nome_f + len_f - 7, ".ebuild") == 0) {
-                    char versao_limpa[64];
-                    snprintf(versao_limpa, sizeof(versao_limpa), "%s", nome_f);
-                    
-                    // Remove o ".ebuild" no final
-                    versao_limpa[strlen(versao_limpa) - 7] = '\0';
-                    
-                    // Remove o prefixo "nome_do_pacote-"
-                    char *inicio_versao = strstr(versao_limpa, sufixo_ebuild);
-                    if (inicio_versao == versao_limpa) {
-                        inicio_versao += strlen(sufixo_ebuild);
-                        snprintf(pkg->versoes[pkg->total_versoes], 50, "%s", inicio_versao);
-                        pkg->total_versoes++;
-                    }
+                versao_limpa[strlen(versao_limpa) - 7] = '\0';
+                
+                char *inicio_versao = strstr(versao_limpa, sufixo_ebuild);
+                if (inicio_versao == versao_limpa) {
+                    inicio_versao += strlen(sufixo_ebuild);
+                    snprintf(pkg->versoes[pkg->total_versoes], 50, "%s", inicio_versao);
+                    pkg->total_versoes++;
                 }
             }
         }
@@ -297,17 +306,13 @@ PacoteGentoo* procurar_pacote(const char* categoria, const char* nome_pacote, co
 
 // SUITE DE TESTES
 int main() {
-    // Inicialização global da biblioteca curl e xml
     curl_global_init(CURL_GLOBAL_ALL);
     LIBXML_TEST_VERSION
 
     printf("===============================================================\n");
-    printf("           PyAPI - SUITE DE TESTES DA BIBLIOTECA (C VERSION)  \n");
+    printf("           PyAPI - SUITE DE TESTES DA BIBLIOTECA (GENTOO NATIVE) \n");
     printf("===============================================================\n\n");
 
-    // -----------------------------------------------------------------
-    // TESTE 1: Módulo de Repositórios (Listagem Global)
-    // -----------------------------------------------------------------
     printf("[TESTE 1] A testar listagem global de repositórios da comunidade...\n");
     int total_repos = 0;
     RepoGentoo *todos_repos = listar_todos_repos(&total_repos);
@@ -317,9 +322,6 @@ int main() {
     }
     printf("----------------------------------------------------------------------\n\n");
 
-    // -----------------------------------------------------------------
-    // TESTE 2: Módulo de Repositórios (Busca Específica)
-    // -----------------------------------------------------------------
     const char* nome_repo = "guru";
     printf("[TESTE 2] A testar a busca do repositório específico: '%s'...\n", nome_repo);
     RepoGentoo *repo_encontrado = procurar_repo(nome_repo);
@@ -331,9 +333,6 @@ int main() {
         printf("❌ Falha: O repositório '%s' não foi retornado.\n\n", nome_repo);
     }
 
-    // -----------------------------------------------------------------
-    // TESTE 3: Módulo de Pacotes (Busca no Gentoo Oficial)
-    // -----------------------------------------------------------------
     printf("[TESTE 3] A testar busca de pacote informando obrigatoriamente 'gentoo'...\n");
     PacoteGentoo *pkg_oficial = procurar_pacote("net-firewall", "nftables", "gentoo");
     if (pkg_oficial) {
@@ -344,9 +343,6 @@ int main() {
         printf("❌ Falha: Não foi possível obter o pacote oficial.\n\n");
     }
 
-    // -----------------------------------------------------------------
-    // TESTE 4: Módulo de Pacotes (Busca em Overlay da Comunidade)
-    // -----------------------------------------------------------------
     printf("[TESTE 4] A testar busca de pacote informando obrigatoriamente o overlay 'guru'...\n");
     PacoteGentoo *pkg_overlay = procurar_pacote("dev-util", "git-cliff", "guru");
     if (pkg_overlay) {
@@ -357,9 +353,6 @@ int main() {
         printf("❌ Falha: Não foi possível obter o pacote do overlay.\n\n");
     }
 
-    // -----------------------------------------------------------------
-    // TESTE 5: Módulo de Pacotes (Tratamento de Erros / Pacote Inexistente)
-    // -----------------------------------------------------------------
     printf("[TESTE 5] A testar comportamento ao procurar um pacote que não existe...\n");
     PacoteGentoo *pkg_fantasma = procurar_pacote("sys-apps", "pacote-que-nao-existe", "gentoo");
     if (pkg_fantasma == NULL) {
@@ -374,7 +367,6 @@ int main() {
     printf("            TODOS OS TESTES FORAM CONCLUÍDOS!                  \n");
     printf("===============================================================\n");
 
-    // Limpeza de memória global das bibliotecas
     xmlCleanupParser();
     curl_global_cleanup();
     return 0;
