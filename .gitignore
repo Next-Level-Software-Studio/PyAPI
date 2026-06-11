@@ -5,3 +5,4 @@ __pycache__/
 *.env
 venv/
 .vscode/
+!.vscode/c_cpp_properties.json
