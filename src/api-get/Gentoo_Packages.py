@@ -1,12 +1,12 @@
-import urllib.request
-import json
+import urllib.request, json, urllib.parse
 import xml.etree.ElementTree as ET
 from urllib.error import HTTPError
 
+
 class Repository:
-    """Classe responsável por gerenciar e descobrir Repositórios (Overlays)."""
     URL_REPOS = "https://api.gentoo.org/overlays/repositories.xml"
-    HEADERS = {'User-Agent': 'api-get/1.0'}
+    
+    HEADERS = {'User-Agent': 'api-get'}
     
     _cache = None
 
@@ -66,14 +66,17 @@ class Repository:
 
 
 class Package:
-    """Classe responsável por descobrir Pacotes com cache local ultra rápido."""
-    HEADERS = {'User-Agent': 'api-get/1.0', 'Accept-Encoding': 'gzip'}
+    """Class responsible for managing and discovering Packages via Gentoo's Official API."""
     
-    # Cache de pacotes para buscas repetidas instantâneas
+    HEADERS = {
+        'User-Agent': 'api-get',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Encoding': 'gzip, deflate'
+    }
+    
     _package_cache = {}
 
     def __init__(self, pack_json):
-        # A API do Gentoo entrega os metadados do pacote dentro da chave principal "package"
         data = pack_json.get("package", pack_json)
         
         self.category = data.get("category", "Unknown")
@@ -83,67 +86,110 @@ class Package:
         homepage_data = data.get("homepage", [])
         self.homepage = homepage_data[0] if isinstance(homepage_data, list) and homepage_data else ""
         
-        # Na API oficial, as versões ficam dentro da lista de "ebuilds"
-        ebuilds_list = data.get("ebuilds", [])
+        self.versions = []
+        self.stable_versions = []
+        self.testing_versions = []
         
-        # Extrai a string da versão de cada ebuild usando list comprehension de alta performance
-        # Usamos dict.fromkeys() para remover duplicatas de forma rápida e limpa
-        self.versions = list(dict.fromkeys([
-            ebuild.get("version") 
-            for ebuild in ebuilds_list 
-            if ebuild.get("version")
-        ]))
+        ebuilds_list = data.get("ebuilds", [])
+        for ebuild in ebuilds_list:
+            version = ebuild.get("version")
+            if version:
+                self.versions.append(version)
+                
+                keywords = ebuild.get("keywords", [])
+                is_stable = any(kw.get("status") == "stable" for kw in keywords)
+                
+                if is_stable:
+                    self.stable_versions.append(version)
+                else:
+                    self.testing_versions.append(version)
+        
+        self.versions = list(dict.fromkeys(self.versions))
+        self.stable_versions = list(dict.fromkeys(self.stable_versions))
+        self.testing_versions = list(dict.fromkeys(self.testing_versions))
+
+        self.use_flags = {
+            flag.get("name"): flag.get("description")
+            for flag in data.get("use_flags", [])
+            if flag.get("name")
+        }
 
     def info(self, information):
         return getattr(self, information, None) if information else None
 
     @classmethod
+    def _fetch_json(cls, url):
+        req = urllib.request.Request(url, headers=cls.HEADERS)
+        with urllib.request.urlopen(req) as resp:
+            if resp.info().get('Content-Encoding') == 'gzip':
+                import gzip
+                data_bytes = gzip.decompress(resp.read())
+            else:
+                data_bytes = resp.read()
+            return json.loads(data_bytes.decode('utf-8'))
+
+    @classmethod
     def get(cls, category, package_name):
-        """Busca o pacote na API do Gentoo ou retorna do Cache se já foi buscado."""
+        """Fetches a specific package by category and name (Uses Cache)."""
         cache_key = f"{category.lower()}/{package_name.lower()}"
-        
         if cache_key in cls._package_cache:
             return cls._package_cache[cache_key]
 
         url = f"https://packages.gentoo.org/packages/{category}/{package_name}.json"
-        req = urllib.request.Request(url, headers=cls.HEADERS)
-        
         try:
-            with urllib.request.urlopen(req) as resp:
-                if resp.info().get('Content-Encoding') == 'gzip':
-                    import gzip
-                    data = gzip.decompress(resp.read())
-                else:
-                    data = resp.read()
-                    
-                pack_json = json.loads(data.decode('utf-8'))
-                
-                package_obj = cls(pack_json)
-                cls._package_cache[cache_key] = package_obj
-                return package_obj
-                
-        except HTTPError:
-            return None
+            pack_json = cls._fetch_json(url)
+            package_obj = cls(pack_json)
+            cls._package_cache[cache_key] = package_obj
+            return package_obj
         except Exception:
             return None
 
+    @classmethod
+    def search(cls, package_name):
+        """Global search: Uses Gentoo's search API and extracts the real package."""
+        query = urllib.parse.quote(package_name.lower())
+        url = f"https://packages.gentoo.org/search.json?q={query}"
+        try:
+            results = cls._fetch_json(url)
+            
+            packages_found = []
+            if isinstance(results, dict):
+                for key in ["packages", "results", "packages_found"]:
+                    if key in results:
+                        packages_found = results[key]
+                        break
+                if not packages_found:
+                    packages_found = [results]
+            elif isinstance(results, list):
+                packages_found = results
 
-if __name__ == "__main__":
-    import time
+            if packages_found and len(packages_found) > 0:
+                first_item = packages_found[0]
+                
+                if isinstance(first_item, dict):
+                    pkg_data = first_item.get("package", first_item)
+                    category = pkg_data.get("category")
+                    name = pkg_data.get("name")
+                elif isinstance(first_item, str) and "/" in first_item:
+                    category, name = first_item.split("/", 1)
+                else:
+                    category, name = None, None
+                
+                if category and name:
+                    return cls.get(category, name)
 
-    print("--- Teste de Velocidade de Pacotes (Com Cache) ---")
-    
-    # 1ª vez: Vai na Web buscar os dados da API oficial
-    start = time.time()
-    pkg1 = Package.get("app-shells", "fish")
-    print(f"1ª Busca (Web) levou: {time.time() - start:.4f} segundos")
-    
-    # 2ª vez: Busca local instantânea O(1)
-    start = time.time()
-    pkg2 = Package.get("app-shells", "fish")
-    print(f"2ª Busca (Cache) levou: {time.time() - start:.6f} segundos (Instantâneo)")
+            return cls.get("app-misc", package_name)
 
-    if pkg1:
-        print(f"\nPacote: {pkg1.category}/{pkg1.name}")
-        print(f"Descrição: {pkg1.description}")
-        print(f"Versões: {pkg1.versions}")
+        except Exception:
+            return cls.get("app-misc", package_name)
+
+    @classmethod
+    def list_by_category(cls, category):
+        """Returns a list containing the names of all packages inside a category."""
+        url = f"https://packages.gentoo.org/categories/{category}.json"
+        try:
+            category_json = cls._fetch_json(url)
+            data = category_json.get("category", category_json)
+            return [pkg.get("name") for pkg in data.get("packages", []) if pkg.get("name")]
+        except Exception:
+            return []
