@@ -6,13 +6,11 @@ from urllib.error import HTTPError
 class Repository:
     """Classe responsável por gerenciar e descobrir Repositórios (Overlays)."""
     URL_REPOS = "https://api.gentoo.org/overlays/repositories.xml"
-    HEADERS = {'User-Agent': 'PyAPI/1.0'}
+    HEADERS = {'User-Agent': 'api-get/1.0'}
     
-    # Cache de classe para evitar downloads repetidos do XML
     _cache = None
 
     def __init__(self, xml_element):
-        """Blueprint para estruturar dados obtidos do XML oficial."""
         name_node = xml_element.find("name")
         self.name = name_node.text.strip() if name_node is not None else "Unknown"
         
@@ -36,13 +34,10 @@ class Repository:
             self.owner_name = name_node.text.strip() if name_node is not None else ""
 
     def info(self, information=None):
-        if information and hasattr(self, information):
-            return getattr(self, information)
-        return None
+        return getattr(self, information, None) if information else None
 
     @classmethod
     def _load_cache(cls):
-        """Baixa o XML uma única vez e monta um dicionário de busca rápida O(1)."""
         if cls._cache is not None:
             return
 
@@ -50,98 +45,105 @@ class Repository:
         req = urllib.request.Request(cls.URL_REPOS, headers=cls.HEADERS)
         try:
             with urllib.request.urlopen(req) as resp:
-                # Otimização: iterparse limpa a memória e processa em stream
                 context = ET.iterparse(resp, events=("end",))
                 for event, elem in context:
                     if elem.tag == "repo":
                         repo_obj = cls(elem)
-                        # Indexa pelo nome em minúsculas para busca ultra rápida
                         cls._cache[repo_obj.name.lower()] = repo_obj
-                        elem.clear() # Libera memória do elemento processado
-        except Exception as e:
-            print(f"❌ Erro ao descarregar repositórios: {e}")
-            cls._cache = {}
+                        elem.clear() 
+        except Exception:
+            cls._cache = None 
 
     @classmethod
     def list_all(cls):
-        """Retorna uma lista com todos os Repositories utilizando o cache."""
         cls._load_cache()
-        return list(cls._cache.values())
+        return list(cls._cache.values()) if cls._cache else []
 
     @classmethod
     def get(cls, target_name):
-        """Busca instantânea O(1) por um repositório específico usando o cache."""
         cls._load_cache()
-        return cls._cache.get(target_name.lower())
+        return cls._cache.get(target_name.lower()) if cls._cache else None
 
 
 class Package:
-    """Classe responsável por descobrir Pacotes."""
-    HEADERS = {'User-Agent': 'PyAPI/1.0'}
+    """Classe responsável por descobrir Pacotes com cache local ultra rápido."""
+    HEADERS = {'User-Agent': 'api-get/1.0', 'Accept-Encoding': 'gzip'}
+    
+    # Cache de pacotes para buscas repetidas instantâneas
+    _package_cache = {}
 
-    def __init__(self, category, name, file_list, source_repo):
-        """Blueprint para estruturar os dados do pacote e extrair versões de forma eficiente."""
-        self.category = category
-        self.name = name
-        self.source_repository = source_repo
+    def __init__(self, pack_json):
+        # A API do Gentoo entrega os metadados do pacote dentro da chave principal "package"
+        data = pack_json.get("package", pack_json)
         
-        # Otimização com list comprehension direta e startswith/endswith rápidos
-        prefix = f"{name}-"
-        self.versions = [
-            f["name"][len(prefix):-7] # Corta o prefixo e o '.ebuild' via slice (muito mais rápido que .replace)
-            for f in file_list 
-            if f["name"].endswith(".ebuild") and f["name"].startswith(prefix)
-        ]
+        self.category = data.get("category", "Unknown")
+        self.name = data.get("name", "Unknown")
+        self.description = data.get("description", "")
+        
+        homepage_data = data.get("homepage", [])
+        self.homepage = homepage_data[0] if isinstance(homepage_data, list) and homepage_data else ""
+        
+        # Na API oficial, as versões ficam dentro da lista de "ebuilds"
+        ebuilds_list = data.get("ebuilds", [])
+        
+        # Extrai a string da versão de cada ebuild usando list comprehension de alta performance
+        # Usamos dict.fromkeys() para remover duplicatas de forma rápida e limpa
+        self.versions = list(dict.fromkeys([
+            ebuild.get("version") 
+            for ebuild in ebuilds_list 
+            if ebuild.get("version")
+        ]))
 
     def info(self, information):
-        if information and hasattr(self, information):
-            return getattr(self, information)
-        return None
+        return getattr(self, information, None) if information else None
 
     @classmethod
-    def get(cls, category, package_name, repository):
-        """Busca o pacote na API do GitHub."""
-        repo_lower = repository.lower()
-        if repo_lower == "gentoo":
-            url = f"https://api.github.com/repos/gentoo/gentoo/contents/{category}/{package_name}"
-        else:
-            # CORRIGIDO: de {repo} para {repository}
-            url = f"https://api.github.com/repos/gentoo-mirror/{repository}/contents/{category}/{package_name}"
-            
+    def get(cls, category, package_name):
+        """Busca o pacote na API do Gentoo ou retorna do Cache se já foi buscado."""
+        cache_key = f"{category.lower()}/{package_name.lower()}"
+        
+        if cache_key in cls._package_cache:
+            return cls._package_cache[cache_key]
+
+        url = f"https://packages.gentoo.org/packages/{category}/{package_name}.json"
         req = urllib.request.Request(url, headers=cls.HEADERS)
+        
         try:
             with urllib.request.urlopen(req) as resp:
-                file_list = json.loads(resp.read().decode('utf-8'))
-                return cls(category, package_name, file_list, source_repo=repository)
-        except HTTPError as e:
-            if e.code == 404:
-                print(f"❌ O pacote '{category}/{package_name}' não existe no repositório '{repository}'.")
-            else:
-                print(f"❌ Erro de Rede na API do GitHub (Código: {e.code})")
+                if resp.info().get('Content-Encoding') == 'gzip':
+                    import gzip
+                    data = gzip.decompress(resp.read())
+                else:
+                    data = resp.read()
+                    
+                pack_json = json.loads(data.decode('utf-8'))
+                
+                package_obj = cls(pack_json)
+                cls._package_cache[cache_key] = package_obj
+                return package_obj
+                
+        except HTTPError:
             return None
-        except Exception as e:
-            print(f"❌ Erro inesperado: {e}")
+        except Exception:
             return None
 
 
 if __name__ == "__main__":
     import time
 
-    # Teste de Velocidade do Cache de Repositórios
-    print("--- Teste de Velocidade ---")
+    print("--- Teste de Velocidade de Pacotes (Com Cache) ---")
     
+    # 1ª vez: Vai na Web buscar os dados da API oficial
     start = time.time()
-    guru = Repository.get("guru")
-    print(f"1ª Busca ('guru') levou: {time.time() - start:.4f} segundos (Baixou o XML)")
+    pkg1 = Package.get("app-shells", "fish")
+    print(f"1ª Busca (Web) levou: {time.time() - start:.4f} segundos")
     
+    # 2ª vez: Busca local instantânea O(1)
     start = time.time()
-    steam = Repository.get("steam-overlay")
-    print(f"2ª Busca ('steam-overlay') levou: {time.time() - start:.6f} segundos (Instântaneo via Cache)")
-    
-    if guru:
-        print(f"\nHomepage do Guru: {guru.info('homepage')}")
-        
-    # Exemplo de uso do Package (Corrigido)
-    # cpuid = Package.get("sys-apps", "cpuid", "gentoo")
-    # if cpuid:
-    #     print(f"Versões encontradas: {cpuid.versions}")
+    pkg2 = Package.get("app-shells", "fish")
+    print(f"2ª Busca (Cache) levou: {time.time() - start:.6f} segundos (Instantâneo)")
+
+    if pkg1:
+        print(f"\nPacote: {pkg1.category}/{pkg1.name}")
+        print(f"Descrição: {pkg1.description}")
+        print(f"Versões: {pkg1.versions}")
